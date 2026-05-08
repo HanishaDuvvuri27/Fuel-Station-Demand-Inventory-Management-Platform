@@ -31,6 +31,12 @@ def initialize_database(reset: bool = False, db_path: str = DB_PATH) -> None:
         if reset:
             conn.executescript(
                 """
+                DROP TABLE IF EXISTS data_quality_reports;
+                DROP TABLE IF EXISTS revenue_rollups;
+                DROP TABLE IF EXISTS inventory_snapshots;
+                DROP TABLE IF EXISTS daily_demand_summary;
+                DROP TABLE IF EXISTS rejected_records;
+                DROP TABLE IF EXISTS pipeline_runs;
                 DROP TABLE IF EXISTS owner_station_access;
                 DROP TABLE IF EXISTS transactions;
                 DROP TABLE IF EXISTS fuel_inventory;
@@ -541,6 +547,92 @@ def get_admin_overview() -> dict:
     with get_connection() as conn:
         row = conn.execute(query).fetchone()
     return dict(row) if row else {}
+
+
+def get_city_kpis(days: int = 30) -> dict:
+    query = """
+    WITH revenue AS (
+        SELECT SUM(CASE WHEN t.liters_sold > 0 THEN t.liters_sold * fi.price ELSE 0 END) AS total_revenue
+        FROM transactions t
+        JOIN fuel_inventory fi ON fi.station_id = t.station_id AND fi.fuel_type = t.fuel_type
+        WHERE DATE(t.txn_time) >= DATE('now', ?)
+    ),
+    turnover AS (
+        SELECT
+            AVG(
+                CASE
+                    WHEN fi.available_liters <= 0 THEN NULL
+                    ELSE COALESCE(sold.sold_liters, 0) / fi.available_liters
+                END
+            ) AS avg_turnover
+        FROM fuel_inventory fi
+        LEFT JOIN (
+            SELECT station_id, fuel_type, SUM(liters_sold) AS sold_liters
+            FROM transactions
+            WHERE liters_sold > 0 AND DATE(txn_time) >= DATE('now', ?)
+            GROUP BY station_id, fuel_type
+        ) sold ON sold.station_id = fi.station_id AND sold.fuel_type = fi.fuel_type
+    )
+    SELECT
+        ROUND(COALESCE((SELECT total_revenue FROM revenue), 0), 2) AS total_revenue,
+        (SELECT COUNT(*) FROM stations) AS active_stations,
+        (SELECT COUNT(*) FROM fuel_inventory WHERE available_liters < 200) AS stockout_alerts,
+        ROUND(COALESCE((SELECT avg_turnover FROM turnover), 0), 3) AS avg_inventory_turnover
+    """
+    with get_connection() as conn:
+        row = conn.execute(query, (f"-{int(days)} day", f"-{int(days)} day")).fetchone()
+    return dict(row) if row else {}
+
+
+def get_pipeline_run_log(limit: int = 25) -> pd.DataFrame:
+    query = """
+    SELECT
+        run_id,
+        pipeline_name,
+        source_path,
+        started_at,
+        completed_at,
+        status,
+        rows_ingested,
+        rows_rejected,
+        message
+    FROM pipeline_runs
+    ORDER BY started_at DESC
+    LIMIT ?
+    """
+    with get_connection() as conn:
+        return pd.read_sql_query(query, conn, params=(int(limit),))
+
+
+def get_latest_quality_report(limit: int = 50) -> pd.DataFrame:
+    query = """
+    SELECT
+        dqr.report_id,
+        dqr.run_id,
+        dqr.check_name,
+        dqr.severity,
+        dqr.anomaly_count,
+        dqr.details,
+        dqr.created_at,
+        pr.status AS run_status
+    FROM data_quality_reports dqr
+    LEFT JOIN pipeline_runs pr ON pr.run_id = dqr.run_id
+    ORDER BY dqr.created_at DESC, dqr.report_id DESC
+    LIMIT ?
+    """
+    with get_connection() as conn:
+        return pd.read_sql_query(query, conn, params=(int(limit),))
+
+
+def get_rejected_records(limit: int = 50) -> pd.DataFrame:
+    query = """
+    SELECT rejected_id, run_id, source_path, rejection_reason, created_at, record_payload
+    FROM rejected_records
+    ORDER BY created_at DESC, rejected_id DESC
+    LIMIT ?
+    """
+    with get_connection() as conn:
+        return pd.read_sql_query(query, conn, params=(int(limit),))
 
 
 def get_daily_demand_trend(days: int = 30, fuel_type: Optional[str] = None, station_ids: Optional[list[int]] = None) -> pd.DataFrame:

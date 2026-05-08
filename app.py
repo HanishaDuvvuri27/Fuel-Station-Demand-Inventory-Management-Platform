@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import base64
+import html
 import os
 import folium
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 from folium.plugins import Fullscreen, MarkerCluster
 
@@ -21,12 +22,16 @@ from database import (
     get_area_fuel_mix,
     get_areas,
     get_average_price_per_area,
+    get_city_kpis,
     get_daily_demand_trend,
     get_hourly_demand_pattern,
+    get_latest_quality_report,
     get_nearby_stations,
     get_owner_station_ids,
     get_owner_summary,
+    get_pipeline_run_log,
     get_price_spread_by_area,
+    get_rejected_records,
     get_revenue_estimate_per_station,
     get_station_inventory_row,
     get_station_fuel_types,
@@ -42,7 +47,7 @@ from database import (
 )
 from utils import recommend_stations
 
-st.set_page_config(page_title="Fuel Demand & Inventory Platform", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="Fuel Demand & Inventory Platform", layout="wide", initial_sidebar_state="expanded")
 ADMIN_SIGNUP_CODE = os.getenv("ADMIN_SIGNUP_CODE", "ADMIN2026")
 
 
@@ -62,6 +67,68 @@ def _format_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+COLUMN_LABELS = {
+    "area": "Area",
+    "assigned_at": "Assigned At",
+    "available_liters": "Available (L)",
+    "avg_daily_sales": "Avg Daily Sales",
+    "avg_daily_sales_7d": "Avg Daily Sales (7D)",
+    "avg_inventory_turnover": "Avg Inventory Turnover",
+    "avg_price": "Avg Price (₹)",
+    "anomaly_count": "Anomaly Count",
+    "captured_at": "Captured At",
+    "check_name": "Check Name",
+    "completed_at": "Completed At",
+    "created_at": "Created At",
+    "current_stock_liters": "Current Stock (L)",
+    "day": "Date",
+    "details": "Details",
+    "distance_km": "Distance (km)",
+    "estimated_days_to_stockout": "Days to Stockout",
+    "estimated_revenue": "Estimated Revenue (₹)",
+    "fuel_type": "Fuel Type",
+    "growth_pct": "Growth (%)",
+    "home_latitude": "Home Latitude",
+    "home_longitude": "Home Longitude",
+    "hour_of_day": "Hour",
+    "last_updated": "Last Updated",
+    "latitude": "Latitude",
+    "liters_sold": "Liters Sold",
+    "longitude": "Longitude",
+    "message": "Message",
+    "name": "Station Name",
+    "pipeline_name": "Pipeline Name",
+    "price": "Price (₹)",
+    "record_payload": "Record Payload",
+    "rejection_reason": "Rejection Reason",
+    "report_id": "Report ID",
+    "rows_ingested": "Rows Ingested",
+    "rows_rejected": "Rows Rejected",
+    "run_id": "Run ID",
+    "run_status": "Run Status",
+    "severity": "Severity",
+    "source_path": "Source Path",
+    "started_at": "Started At",
+    "station_id": "Station ID",
+    "status": "Status",
+    "total_liters_sold": "Total Sold (L)",
+    "total_revenue": "Total Revenue (₹)",
+    "transaction_count": "Transactions",
+    "turnover_ratio": "Turnover Ratio",
+    "user_id": "User ID",
+    "username": "Username",
+}
+
+
+def _humanize_column(column: str) -> str:
+    if column in COLUMN_LABELS:
+        return COLUMN_LABELS[column]
+    if column.startswith("sold_liters_") and column.endswith("d"):
+        days = column.replace("sold_liters_", "").replace("d", "")
+        return f"Sold Liters ({days}D)"
+    return column.replace("_", " ").title()
+
+
 def _fmt_number(value: float | int, precision: int = 2) -> str:
     try:
         return f"{float(value):,.{precision}f}"
@@ -70,7 +137,39 @@ def _fmt_number(value: float | int, precision: int = 2) -> str:
 
 
 def _show_df(df: pd.DataFrame) -> None:
-    st.dataframe(_format_dataframe(df), use_container_width=True, hide_index=True)
+    formatted = _format_dataframe(df)
+    if formatted.empty:
+        st.info("No records available.")
+        return
+
+    renamed = formatted.rename(columns={col: _humanize_column(str(col)) for col in formatted.columns})
+    rows: list[str] = []
+    for _, row in renamed.iterrows():
+        row_class = ""
+        if "Available (L)" in renamed.columns and pd.notna(row.get("Available (L)")) and float(row.get("Available (L)")) < 200:
+            row_class = " risk-row"
+        if "Days to Stockout" in renamed.columns and pd.notna(row.get("Days to Stockout")) and float(row.get("Days to Stockout")) <= 7:
+            row_class = " risk-row"
+        if "Severity" in renamed.columns and str(row.get("Severity")).lower() == "critical":
+            row_class = " risk-row"
+        if "Status" in renamed.columns and str(row.get("Status")).lower() == "failed":
+            row_class = " risk-row"
+
+        cells = "".join(f"<td>{html.escape(str(value))}</td>" for value in row.tolist())
+        rows.append(f"<tr class='{row_class.strip()}'>{cells}</tr>")
+
+    headers = "".join(f"<th>{html.escape(str(col))}</th>" for col in renamed.columns)
+    st.markdown(
+        f"""
+        <div class="table-wrap">
+            <table class="data-table">
+                <thead><tr>{headers}</tr></thead>
+                <tbody>{''.join(rows)}</tbody>
+            </table>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _render_kpi_row(cards: list[tuple[str, str, str]]) -> None:
@@ -98,33 +197,7 @@ def _section_card_end() -> None:
 
 
 def _role_hero(role: str) -> None:
-    role_map = {
-        "fuel_user": (
-            "Fuel User Workspace",
-            "Find the best nearby stations with live price and stock intelligence.",
-            "https://images.unsplash.com/photo-1493238792000-8113da705763?auto=format&fit=crop&w=1600&q=80",
-        ),
-        "station_owner": (
-            "Station Owner Workspace",
-            "Manage operations, reduce stockout risk, and optimize revenue.",
-            "https://images.unsplash.com/photo-1464802686167-b939a6910659?auto=format&fit=crop&w=1600&q=80",
-        ),
-        "admin": (
-            "Admin Command Center",
-            "Monitor city-wide demand, pricing strategy, and network performance.",
-            "https://images.unsplash.com/photo-1469474968028-56623f02e42e?auto=format&fit=crop&w=1600&q=80",
-        ),
-    }
-    title, subtitle, img = role_map.get(role, role_map["admin"])
-    st.markdown(
-        f"""
-        <div class="hero-panel" style="background-image: linear-gradient(90deg, rgba(7,36,69,0.78), rgba(12,69,119,0.56)), url('{img}');">
-            <div class="hero-title">{title}</div>
-            <div class="hero-sub">{subtitle}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    return None
 
 
 def _top_app_bar(user: dict) -> bool:
@@ -146,38 +219,67 @@ def _top_app_bar(user: dict) -> bool:
 
 
 def _landing_hero_image() -> None:
-    local_path = os.path.join(os.path.dirname(__file__), "assets", "landing_hero.jpg")
-    if os.path.exists(local_path):
-        st.image(local_path, use_container_width=True)
-    else:
-        st.image(
-            "https://images.unsplash.com/photo-1553095066-5014bc7b7f2d?auto=format&fit=crop&w=1600&q=80",
-            use_container_width=True,
-        )
+    return None
 
 
 def _landing_image_base64() -> str:
-    local_path = os.path.join(os.path.dirname(__file__), "assets", "landing_hero.jpg")
-    if os.path.exists(local_path):
-        with open(local_path, "rb") as f:
-            return base64.b64encode(f.read()).decode("utf-8")
     return ""
 
 
 def _page_header(title: str, subtitle: str, chip: str) -> None:
-    st.markdown(f'<span class="page-chip">{chip}</span>', unsafe_allow_html=True)
-    st.title(title)
-    st.markdown(f'<p class="page-note">{subtitle}</p>', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="page-header">
+            <span class="page-chip">{html.escape(chip)}</span>
+            <h1>{html.escape(title)}</h1>
+            <p>{html.escape(subtitle)}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _top_app_bar(user: dict) -> bool:
+    role_text = str(user["role"]).replace("_", " ").title()
+    c1, c2 = st.columns([8, 2])
+    with c1:
+        st.markdown(
+            f"""
+            <div class="top-appbar">
+                <div>
+                    <div class="top-appbar-title">{html.escape(str(user['username']))}</div>
+                    <div class="top-appbar-sub">FuelOps Control Center</div>
+                </div>
+                <span class="role-pill">{html.escape(role_text)}</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown('<div class="logout-spacer"></div>', unsafe_allow_html=True)
+        return st.button("Logout", key="top_logout_btn", use_container_width=True)
 
 
 def _role_nav(options: list[str], key: str, label: str = "Navigation") -> str:
-    return st.segmented_control(
-        label,
-        options=options,
-        default=options[0],
-        key=key,
-        selection_mode="single",
-    )
+    return st.sidebar.radio(label, options=options, index=0, key=key)
+
+
+def _plot_line(df: pd.DataFrame, x: str, y: str, title: str, color: str | None = None) -> None:
+    if df.empty:
+        st.info("No data available for this chart.")
+        return
+    fig = px.line(df, x=x, y=y, color=color, markers=True, title=title)
+    fig.update_layout(margin=dict(l=8, r=8, t=44, b=8), height=360, template="plotly_white")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _plot_bar(df: pd.DataFrame, x: str, y: str, title: str, color: str | None = None) -> None:
+    if df.empty:
+        st.info("No data available for this chart.")
+        return
+    fig = px.bar(df, x=x, y=y, color=color, title=title)
+    fig.update_layout(margin=dict(l=8, r=8, t=44, b=8), height=360, template="plotly_white")
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def _apply_ui_theme() -> None:
@@ -196,8 +298,7 @@ def _apply_ui_theme() -> None:
             --shadow: 0 12px 30px rgba(19, 54, 92, 0.10);
         }
         .stApp {
-            background:
-                radial-gradient(circle at 0% 0%, #ffffff 0%, #f4f8fe 40%, #e9f1fb 100%) !important;
+            background: #F8F9FA !important;
             color: var(--text);
         }
         [data-testid="stAppViewContainer"] { background: transparent !important; }
@@ -208,7 +309,7 @@ def _apply_ui_theme() -> None:
             box-shadow: var(--shadow);
         }
         .top-appbar {
-            background: linear-gradient(135deg, #ffffff 0%, #f0f6ff 100%);
+            background: #ffffff;
             border: 1px solid #d5e4f7;
             border-radius: 14px;
             padding: 10px 14px;
@@ -285,8 +386,12 @@ def _apply_ui_theme() -> None:
         }
         h1, h2, h3 { color: var(--text); }
 
-        /* Sidebar: remove black look */
-        [data-testid="stSidebar"] { display: none !important; }
+        /* Sidebar */
+        [data-testid="stSidebar"] {
+            background: #f7fbff !important;
+            border-right: 1px solid var(--border);
+        }
+        [data-testid="stSidebar"] * { color: #173a5e; }
 
         /* Tabs */
         .stTabs [role="tablist"] {
@@ -339,7 +444,7 @@ def _apply_ui_theme() -> None:
         /* Buttons */
         .stButton button,
         .stFormSubmitButton button {
-            background: linear-gradient(135deg, #1f6feb, #2e82ff) !important;
+            background: #0A2540 !important;
             color: #ffffff !important;
             border: none !important;
             border-radius: 10px !important;
@@ -417,6 +522,122 @@ def _apply_ui_theme() -> None:
         unsafe_allow_html=True,
     )
 
+    st.markdown(
+        """
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+        :root {
+            --page-bg: #F8F9FA;
+            --card-bg: #FFFFFF;
+            --navy: #0A2540;
+            --blue: #2D6CDF;
+            --text: #0A2540;
+            --muted: #6B7280;
+            --border: #E5E7EB;
+            --row-alt: #F4F7FB;
+            --danger-bg: #FFF1F2;
+            --danger-border: #E11D48;
+            --shadow: 0 12px 28px rgba(10, 37, 64, 0.08);
+        }
+        html, body, .stApp, [data-testid="stAppViewContainer"] {
+            background: var(--page-bg) !important;
+            color: var(--text) !important;
+            font-family: 'Inter', sans-serif !important;
+        }
+        * { font-family: 'Inter', sans-serif !important; letter-spacing: 0 !important; }
+        .block-container { max-width: 1280px; padding-top: 1rem; padding-bottom: 2rem; }
+        h1, h2, h3, h4, h5, h6 { color: var(--navy) !important; }
+        .top-appbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            background: var(--card-bg) !important;
+            border: 1px solid var(--border) !important;
+            border-radius: 8px !important;
+            padding: 12px 16px !important;
+            margin-bottom: 12px !important;
+            box-shadow: none !important;
+        }
+        .top-appbar-title { color: var(--navy) !important; font-size: 15px !important; font-weight: 700 !important; line-height: 1.2; }
+        .top-appbar-sub { color: var(--muted) !important; font-size: 12px !important; margin-top: 2px; }
+        .role-pill, .page-chip {
+            display: inline-flex;
+            align-items: center;
+            width: fit-content;
+            border-radius: 999px;
+            background: var(--navy) !important;
+            color: #FFFFFF !important;
+            font-size: 11px;
+            font-weight: 700;
+            padding: 4px 9px;
+            text-transform: uppercase;
+        }
+        .logout-spacer { height: 8px; }
+        .page-header { margin: 8px 0 16px 0; }
+        .page-header h1 { color: var(--navy) !important; font-size: 22px !important; font-weight: 800 !important; line-height: 1.25; margin: 8px 0 4px; }
+        .page-header p { color: var(--muted) !important; font-size: 14px !important; margin: 0; }
+        .hero-panel { display: none !important; }
+        .section-card, .app-card {
+            background: var(--card-bg) !important;
+            border: 1px solid var(--border) !important;
+            border-radius: 8px !important;
+            box-shadow: none !important;
+            padding: 16px !important;
+            margin-bottom: 16px !important;
+            animation: none !important;
+        }
+        .kpi-card {
+            background: var(--card-bg) !important;
+            border: 1px solid var(--border) !important;
+            border-left: 3px solid var(--blue) !important;
+            border-radius: 8px !important;
+            box-shadow: none !important;
+            min-height: 104px;
+            padding: 14px 16px;
+        }
+        .kpi-label { color: var(--muted) !important; font-size: 12px !important; font-weight: 700 !important; text-transform: uppercase; margin-bottom: 8px; }
+        .kpi-value { color: var(--navy) !important; font-size: 28px !important; font-weight: 800 !important; line-height: 1.1; }
+        .kpi-hint { color: var(--muted) !important; font-size: 12px !important; margin-top: 6px; }
+        .table-wrap { border: 1px solid var(--border); border-radius: 8px; overflow: auto; margin: 8px 0 16px; background: var(--card-bg); }
+        .data-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        .data-table th { background: var(--navy); color: #FFFFFF; padding: 10px 14px; text-align: left; font-weight: 700; white-space: nowrap; }
+        .data-table td { padding: 10px 14px; border-bottom: 1px solid var(--border); color: #1F2937; vertical-align: top; }
+        .data-table tbody tr:nth-child(even) { background: var(--row-alt); }
+        .data-table tbody tr.risk-row { background: var(--danger-bg); box-shadow: inset 3px 0 0 var(--danger-border); }
+        .auth-title { color: var(--navy) !important; font-size: 24px !important; font-weight: 800 !important; text-align: center; margin: 0 0 4px !important; text-shadow: none !important; }
+        .auth-title::before { content: "FuelOps"; display: block; color: var(--navy); font-size: 24px; margin-bottom: 8px; }
+        .auth-sub { color: var(--muted) !important; text-align: center; font-size: 13px !important; margin: 0 0 16px !important; text-shadow: none !important; }
+        .auth-panel { max-width: 420px; margin: 0 auto; background: var(--card-bg) !important; border: 1px solid var(--border) !important; border-top: 2px solid var(--navy) !important; border-radius: 8px !important; box-shadow: var(--shadow) !important; padding: 22px !important; }
+        .auth-field-label { color: var(--navy) !important; font-size: 12px !important; font-weight: 700 !important; margin: 8px 0 5px !important; }
+        .stTabs [role="tablist"] { background: transparent !important; border: 0 !important; border-bottom: 1px solid var(--border) !important; border-radius: 0 !important; gap: 18px !important; padding: 0 !important; }
+        .stTabs [role="tab"] { color: var(--muted) !important; background: transparent !important; border: 0 !important; border-radius: 0 !important; padding: 8px 0 !important; font-weight: 600 !important; }
+        .stTabs [aria-selected="true"] { color: var(--navy) !important; border-bottom: 2px solid var(--blue) !important; font-weight: 800 !important; }
+        .stTextInput input, .stNumberInput input, .stSelectbox [data-baseweb="select"] > div, .stMultiSelect [data-baseweb="select"] > div, .stTextArea textarea {
+            background: #FFFFFF !important;
+            color: var(--navy) !important;
+            border: 1px solid #D1D5DB !important;
+            border-radius: 6px !important;
+            box-shadow: none !important;
+        }
+        .stTextInput input:focus, .stNumberInput input:focus, .stTextArea textarea:focus { border-color: var(--blue) !important; box-shadow: 0 0 0 3px rgba(45, 108, 223, 0.16) !important; }
+        .stButton button, .stFormSubmitButton button {
+            background: var(--navy) !important;
+            color: #FFFFFF !important;
+            border: 1px solid var(--navy) !important;
+            border-radius: 6px !important;
+            box-shadow: none !important;
+            font-weight: 700 !important;
+            width: 100%;
+        }
+        .stButton button:hover, .stFormSubmitButton button:hover { background: #12395F !important; border-color: #12395F !important; transform: none !important; }
+        [data-testid="stSidebar"] { background: #FFFFFF !important; border-right: 1px solid var(--border); }
+        [data-testid="stSidebar"] * { color: var(--navy); }
+        .sidebar-profile { background: #F8F9FA !important; border: 1px solid var(--border) !important; border-radius: 8px !important; padding: 10px 12px !important; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 def _render_station_map(df: pd.DataFrame, user_lat: float | None = None, user_lon: float | None = None) -> None:
     if df.empty:
@@ -489,117 +710,11 @@ def _render_station_map(df: pd.DataFrame, user_lat: float | None = None, user_lo
 
 
 def _login_screen() -> None:
-    b64 = _landing_image_base64()
-    if b64:
-        st.markdown(
-            f"""
-            <style>
-            .stApp {{
-                background:
-                    linear-gradient(rgba(11, 34, 58, 0.56), rgba(11, 34, 58, 0.56)),
-                    url("data:image/jpeg;base64,{b64}") center/cover no-repeat fixed !important;
-            }}
-            .auth-panel {{
-                position: relative;
-                overflow: hidden;
-                background: linear-gradient(165deg, rgba(8, 31, 56, 0.78), rgba(10, 42, 74, 0.70)) !important;
-                backdrop-filter: blur(8px);
-                border: 1px solid rgba(185, 214, 245, 0.45) !important;
-                box-shadow: 0 18px 34px rgba(8, 27, 46, 0.42) !important;
-                border-radius: 18px !important;
-                animation: authFade .35s ease-out;
-            }}
-            .auth-panel::before {{
-                content: "";
-                position: absolute;
-                inset: 0;
-                background: radial-gradient(circle at 100% 0%, rgba(124, 188, 255, 0.22), transparent 45%);
-                pointer-events: none;
-            }}
-            .auth-panel [data-testid="stWidgetLabel"] p strong,
-            .auth-panel p strong {{
-                color: #ffffff !important;
-                font-weight: 800 !important;
-                letter-spacing: 0.2px;
-            }}
-            .auth-field-label {{
-                color: #ffffff !important;
-                font-weight: 800 !important;
-                margin: 6px 0 4px 0 !important;
-                letter-spacing: 0.2px;
-            }}
-            .auth-panel [data-testid="stWidgetLabel"] p,
-            .auth-panel [data-testid="stWidgetLabel"] label,
-            .auth-panel label,
-            .auth-panel small,
-            .auth-panel .stCaption {{
-                color: #d8eaff !important;
-                font-weight: 700 !important;
-                opacity: 1 !important;
-            }}
-            .auth-panel .stTextInput input,
-            .auth-panel .stNumberInput input,
-            .auth-panel .stSelectbox [data-baseweb="select"] > div,
-            .auth-panel .stMultiSelect [data-baseweb="select"] > div {{
-                background: rgba(255, 255, 255, 0.95) !important;
-                border: 1px solid #8cb5df !important;
-                color: #0e3358 !important;
-            }}
-            .auth-panel .stTextInput input::placeholder,
-            .auth-panel .stNumberInput input::placeholder {{
-                color: #6e87a0 !important;
-                opacity: 1;
-            }}
-            .auth-panel .stTabs [role="tablist"] {{
-                background: rgba(239, 246, 255, 0.16) !important;
-                border-color: rgba(183, 214, 248, 0.45) !important;
-            }}
-            .auth-panel .stTabs [role="tab"] {{
-                color: #d7eaff !important;
-                font-weight: 700 !important;
-            }}
-            .auth-panel .stTabs [aria-selected="true"] {{
-                color: #ffffff !important;
-                background: linear-gradient(135deg, #1f6feb, #2e82ff) !important;
-                border: none !important;
-                box-shadow: 0 6px 16px rgba(31, 111, 235, 0.34);
-            }}
-            .auth-panel .stFormSubmitButton button {{
-                background: linear-gradient(135deg, #1f6feb, #2e82ff) !important;
-                border: 1px solid rgba(167, 206, 249, 0.55) !important;
-            }}
-            .auth-panel .stExpander {{
-                border-color: rgba(183, 214, 248, 0.4) !important;
-                background: rgba(255,255,255,0.06) !important;
-            }}
-            @keyframes authFade {{
-                from {{
-                    opacity: 0;
-                    transform: translateY(6px);
-                }}
-                to {{
-                    opacity: 1;
-                    transform: translateY(0);
-                }}
-            }}
-            .auth-title, .auth-sub {{
-                color: #ffffff !important;
-                text-shadow: 0 2px 8px rgba(0,0,0,0.45);
-            }}
-            .auth-sub {{
-                font-weight: 600 !important;
-                letter-spacing: 0.1px;
-            }}
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-
     left, center, right = st.columns([1, 2, 1])
     with center:
-        st.markdown('<h1 class="auth-title">Fuel Station Demand & Inventory Platform</h1>', unsafe_allow_html=True)
-        st.markdown('<p class="auth-sub">Secure access for Fuel Users, Station Owners, and Admins</p>', unsafe_allow_html=True)
         st.markdown('<div class="auth-panel">', unsafe_allow_html=True)
+        st.markdown('<h1 class="auth-title">FuelOps Platform</h1>', unsafe_allow_html=True)
+        st.markdown('<p class="auth-sub">Fuel Station Demand & Inventory Management</p>', unsafe_allow_html=True)
 
         login_tab, signup_tab = st.tabs(["Login", "Sign Up"])
 
@@ -726,9 +841,12 @@ def _owner_or_admin_inventory_ops(allowed_station_ids: list[int] | None = None, 
             fuel_type = st.selectbox("Fuel Type", available_fuels, key=f"{key_prefix}_fuel_type")
             inv_row = get_station_inventory_row(station_id, fuel_type)
             if inv_row:
-                c1, c2 = st.columns(2)
-                c1.metric("Current Available (L)", f"{float(inv_row['available_liters']):.2f}")
-                c2.metric("Current Price", f"{float(inv_row['price']):.2f}")
+                _render_kpi_row(
+                    [
+                        ("Current Available (L)", _fmt_number(float(inv_row["available_liters"])), "Selected fuel type"),
+                        ("Current Price (₹)", _fmt_number(float(inv_row["price"])), "Current station price"),
+                    ]
+                )
 
             st.subheader("Refill / Sale / Price")
             add_val = st.number_input("Add liters", min_value=0.0, value=0.0, step=10.0, key=f"{key_prefix}_add")
@@ -958,18 +1076,14 @@ def _station_owner_pages(user: dict) -> None:
         st.subheader("Low Stock Risk (<= 7 Days to Stockout)")
         _show_df(low_stock)
         st.subheader("30-Day Demand Trend")
-        if not daily.empty:
-            st.line_chart(daily.set_index("day")["liters_sold"])
+        _plot_line(daily, "day", "liters_sold", "Demand Trend")
         st.subheader("Hourly Demand Pattern")
-        if not hourly.empty:
-            st.bar_chart(hourly.set_index("hour_of_day")["liters_sold"])
+        _plot_bar(hourly, "hour_of_day", "liters_sold", "Hourly Demand Pattern")
         st.subheader("Revenue by Station")
-        if not revenue.empty:
-            st.bar_chart(revenue.set_index("name")["estimated_revenue"])
+        _plot_bar(revenue, "name", "estimated_revenue", "Revenue by Station")
         _show_df(revenue)
         st.subheader("Demand Growth vs Previous Window")
-        if not growth.empty:
-            st.bar_chart(growth.set_index("name")["growth_pct"])
+        _plot_bar(growth, "name", "growth_pct", "Demand Growth")
         _show_df(growth)
         st.subheader("Inventory Turnover")
         _show_df(turnover)
@@ -986,7 +1100,15 @@ def _station_owner_pages(user: dict) -> None:
 def _admin_pages() -> None:
     _role_hero("admin")
     page = _role_nav(
-        ["Admin Dashboard", "Inventory Management", "Advanced Analytics", "System Map", "User Directory", "Master Setup"],
+        [
+            "Admin Dashboard",
+            "Inventory Management",
+            "Advanced Analytics",
+            "Data Quality",
+            "System Map",
+            "User Directory",
+            "Master Setup",
+        ],
         key="admin_nav",
         label="Admin Workspace",
     )
@@ -995,23 +1117,41 @@ def _admin_pages() -> None:
         _page_header("Admin Dashboard", "Network-wide controls, alerts, and KPI monitoring.", "ADMIN")
         _section_card_start()
         overview = get_admin_overview()
+        city_kpis = get_city_kpis(days=30)
         _render_kpi_row(
             [
-                ("Users", str(int(overview.get("users_count", 0))), "All roles"),
-                ("Stations", str(int(overview.get("stations_count", 0))), "Active network"),
-                ("Low Stock", str(int(overview.get("low_stock_count", 0))), "Immediate attention"),
-                ("Total Sold (L)", _fmt_number(float(overview.get("total_sold_liters") or 0.0)), "Cumulative"),
-                ("Avg Price", _fmt_number(float(overview.get("overall_avg_price") or 0.0)), "Network avg"),
+                ("Total Revenue", _fmt_number(float(city_kpis.get("total_revenue") or 0.0)), "Last 30 days"),
+                ("Active Stations", str(int(city_kpis.get("active_stations", 0))), "City network"),
+                ("Stockout Alerts", str(int(city_kpis.get("stockout_alerts", 0))), "Stock under 200 L"),
+                ("Avg Turnover", _fmt_number(float(city_kpis.get("avg_inventory_turnover") or 0.0), 3), "30-day ratio"),
             ]
         )
 
-        areas = get_areas()
-        selected_area = st.selectbox("Area", areas)
-        fuel_type = st.selectbox("Fuel Type", ["Petrol", "Diesel"], key="admin_dash_fuel")
-        st.subheader("Top Recommended")
-        _show_df(recommend_stations(selected_area, fuel_type, top_n=3))
-        st.subheader("Area Inventory View")
-        _show_df(get_stations_inventory_view(area=selected_area, fuel_type=fuel_type))
+        c1, c2, c3 = st.columns([2, 1, 1])
+        station_lookup = get_station_lookup()
+        station_labels = (station_lookup["name"] + " | " + station_lookup["area"]).tolist() if not station_lookup.empty else []
+        station_label_to_id = dict(zip(station_labels, station_lookup["station_id"].tolist())) if station_labels else {}
+        with c1:
+            station_label = st.selectbox(
+                "Forecast Station",
+                ["All Stations"] + station_labels,
+                key="admin_forecast_station",
+            )
+        with c2:
+            days = st.slider("Date Range", min_value=7, max_value=120, value=30, key="admin_forecast_days")
+        with c3:
+            fuel_type = st.selectbox("Fuel Type", ["All", "Petrol", "Diesel"], key="admin_dash_fuel")
+
+        station_ids = None
+        if station_label != "All Stations":
+            station_ids = [int(station_label_to_id[station_label])]
+        ftype = None if fuel_type == "All" else fuel_type
+        daily = get_daily_demand_trend(days=days, fuel_type=ftype, station_ids=station_ids)
+        _plot_line(daily, "day", "liters_sold", "Demand Forecast Proxy by Date")
+
+        st.subheader("Latest ETL Pipeline Runs")
+        _show_df(get_pipeline_run_log(limit=10))
+        st.caption(f"Users: {int(overview.get('users_count', 0))} | Cumulative sold liters: {_fmt_number(float(overview.get('total_sold_liters') or 0.0))}")
         _section_card_end()
 
     elif page == "Inventory Management":
@@ -1063,32 +1203,27 @@ def _admin_pages() -> None:
         )
 
         st.subheader("Total Demand Per Station")
-        st.bar_chart(demand_station.head(top_n).set_index("name")["total_liters_sold"])
+        _plot_bar(demand_station.head(top_n), "name", "total_liters_sold", "Total Demand Per Station")
         _show_df(demand_station)
 
         st.subheader("Average Price by Area")
-        st.bar_chart(price_area.set_index("area")["avg_price"])
+        _plot_bar(price_area, "area", "avg_price", "Average Price by Area", color="fuel_type")
         _show_df(price_area)
 
         st.subheader(f"Daily Demand Trend ({days} days)")
-        if not daily.empty:
-            st.line_chart(daily.set_index("day")["liters_sold"])
+        _plot_line(daily, "day", "liters_sold", f"Daily Demand Trend ({days} days)")
 
         st.subheader(f"Hourly Demand Pattern ({days} days)")
-        if not hourly.empty:
-            st.bar_chart(hourly.set_index("hour_of_day")["liters_sold"])
+        _plot_bar(hourly, "hour_of_day", "liters_sold", f"Hourly Demand Pattern ({days} days)")
 
         st.subheader("Area Fuel Mix")
-        if not fuel_mix.empty:
-            pivot_mix = fuel_mix.pivot(index="area", columns="fuel_type", values="sold_liters").fillna(0)
-            st.bar_chart(pivot_mix)
+        _plot_bar(fuel_mix, "area", "sold_liters", "Area Fuel Mix", color="fuel_type")
         _show_df(fuel_mix)
 
         st.subheader(f"Price Spread by Area ({fuel_type})")
         _show_df(spread)
         st.subheader("Revenue by Station")
-        if not revenue.empty:
-            st.bar_chart(revenue.set_index("name")["estimated_revenue"])
+        _plot_bar(revenue, "name", "estimated_revenue", "Revenue by Station")
         _show_df(revenue)
         st.subheader("Demand Growth by Station")
         _show_df(growth)
@@ -1097,6 +1232,34 @@ def _admin_pages() -> None:
 
         st.subheader(f"Stockout Risk Report (Top {top_n} Highest Risk)")
         _show_df(stock_risk)
+        _section_card_end()
+
+    elif page == "Data Quality":
+        _page_header("Data Quality Report", "Pipeline health, anomaly counts, and rejected raw records.", "ADMIN")
+        _section_card_start()
+        quality = get_latest_quality_report(limit=50)
+        rejected = get_rejected_records(limit=50)
+        runs = get_pipeline_run_log(limit=20)
+        total_anomalies = int(quality["anomaly_count"].sum()) if not quality.empty else 0
+        rejected_count = int(len(rejected))
+        failed_runs = int((runs["status"] == "failed").sum()) if not runs.empty else 0
+        latest_status = str(runs.iloc[0]["status"]).title() if not runs.empty else "No Runs"
+        _render_kpi_row(
+            [
+                ("Anomalies", str(total_anomalies), "Latest quality records"),
+                ("Rejected Records", str(rejected_count), "Recent rejects"),
+                ("Failed Runs", str(failed_runs), "Recent pipeline history"),
+                ("Pipeline Health", latest_status, "Latest run status"),
+            ]
+        )
+        if not quality.empty:
+            _plot_bar(quality, "check_name", "anomaly_count", "Anomaly Counts by Check", color="severity")
+        st.subheader("Quality Checks")
+        _show_df(quality)
+        st.subheader("Rejected Records")
+        _show_df(rejected)
+        st.subheader("Pipeline Run Log")
+        _show_df(runs)
         _section_card_end()
 
     elif page == "System Map":
@@ -1187,6 +1350,17 @@ def main() -> None:
     if _top_app_bar(user):
         st.session_state["auth_user"] = None
         st.rerun()
+
+    st.sidebar.markdown("### FuelOps")
+    st.sidebar.markdown(
+        f"""
+        <div class="sidebar-profile">
+            <strong>{user['username']}</strong><br>
+            {str(user['role']).replace('_', ' ').title()}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     role = user["role"]
     if role == "fuel_user":
